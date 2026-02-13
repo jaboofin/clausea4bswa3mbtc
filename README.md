@@ -7,7 +7,7 @@
 Chainlink-anchored · 5-signal strategy · Live CLOB execution · Arb & hedge engines
 
 ```
-python bot.py --bankroll 500 --arb --hedge
+python bot.py --bankroll 500 --arb --hedge --sync-live-bankroll
 ```
 
 </div>
@@ -106,24 +106,26 @@ Outputs a direction (UP/DOWN/HOLD) and a confidence score. Only trades when conf
 ## CLI Reference
 
 ```bash
-python bot.py --bankroll 500                # Run with $500, 24/7
-python bot.py --bankroll 100 --cycles 10    # Run 10 windows then stop
-python bot.py --arb-only                    # Arb scanner ONLY — no directional trading
-python bot.py --arb-only --dashboard        # Arb scanner + live dashboard
-python bot.py --bankroll 200 --arb          # Directional + arb scanner together
-python bot.py --bankroll 200 --hedge        # Enable hedge engine
-python bot.py --bankroll 500 --arb --hedge  # Everything on
-python bot.py --bankroll 500 --dashboard    # Enable live dashboard server
+python bot.py --bankroll 500 --arb                              # Directional + arb (recommended mixed mode)
+python bot.py --bankroll 500 --arb --sync-live-bankroll         # Directional + arb with live bankroll sync
+python bot.py --bankroll 500 --arb --hedge --dashboard          # Directional + arb + hedge + dashboard
+python bot.py --bankroll 100 --cycles 10 --arb                  # Run 10 entry windows with arb enabled
+
+python bot.py --arb-only                                        # Arb-only (auto-reads live Polymarket bankroll)
+python bot.py --arb-only --live-bankroll-poll-secs 30           # Arb-only with faster live bankroll refresh
+python bot.py --arb-only --dashboard                            # Arb-only + dashboard
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--bankroll` | 500 | Starting capital in USD |
+| `--bankroll` | 500 | Starting capital in USD for directional mode |
 | `--cycles` | 0 | Max entry windows (0 = run forever) |
-| `--arb-only` | off | **Run ONLY the arb scanner** — no directional trading, pure gap capture |
+| `--arb-only` | off | **Run ONLY the arb scanner** — no directional trading, pure gap capture (live bankroll auto-read) |
 | `--arb` | off | Enable arb scanner alongside directional trading |
 | `--hedge` | off | Enable hedge engine |
 | `--dashboard` | off | Start WebSocket server on :8765 for live dashboard |
+| `--sync-live-bankroll` | off | Sync directional risk bankroll from live Polymarket balance |
+| `--live-bankroll-poll-secs` | 60 | Poll interval (seconds) for live bankroll refresh |
 
 **Ctrl+C** → graceful shutdown. Saves performance snapshot, cancels pending orders, closes connections.
 
@@ -152,6 +154,14 @@ Profit = $0.07 per share (7.5%) — zero risk, no prediction needed
 Scanning across multiple timeframes dramatically increases opportunity surface. Gaps on 1-hour markets tend to persist longer than 15-minute ones, giving the scanner more time to capture them.
 
 The scanner has its own daily budget ($200/day default) separate from directional trading capital, its own trade limits, and a per-market cooldown to avoid re-arbing the same market repeatedly.
+
+**Arb-only live bankroll behavior (new):**
+- In `--arb-only`, the bot reads your live Polymarket balance at startup.
+- `--bankroll` is ignored in `--arb-only` (it still applies to directional mode).
+- Effective arb limits are capped by live funds:
+  - `effective_budget = min(arb_max_daily_budget, live_balance)`
+  - `effective_size_per_side = min(arb_size_usd, effective_budget / 2)`
+- During runtime, the bot periodically refreshes live balance (`--live-bankroll-poll-secs`) and updates arb limits.
 
 | Setting | Default | What it controls |
 |---------|---------|-----------------|
