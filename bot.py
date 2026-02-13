@@ -52,6 +52,8 @@ class BTCPredictionBot:
         self._last_consensus = None
         self._last_anchor = None
         self._last_decision = None
+        self._last_live_bankroll_sync = 0.0
+        self._last_live_bankroll_value = None
 
         # Independent arb scanner (runs its own loop when --arb is enabled)
         if config.edge.enable_arb:
@@ -70,6 +72,25 @@ class BTCPredictionBot:
             self.arb_scanner = None
 
     # ── Trading Cycle ───────────────────────────────────────────
+
+    async def _sync_live_bankroll_if_enabled(self, force: bool = False):
+        if not self.config.polymarket.sync_live_bankroll:
+            return
+
+        now = time.time()
+        poll_secs = max(5, int(self.config.polymarket.live_bankroll_poll_secs))
+        if not force and (now - self._last_live_bankroll_sync) < poll_secs:
+            return
+
+        live_balance = await self.polymarket.get_available_balance_usd()
+        self._last_live_bankroll_sync = now
+
+        if live_balance is None:
+            return
+
+        self._last_live_bankroll_value = round(float(live_balance), 2)
+        self.risk_manager.capital = self._last_live_bankroll_value
+        logger.info(f"Synced live bankroll: ${self._last_live_bankroll_value:.2f}")
 
     async def _trading_cycle(self):
         self._cycle_count += 1
@@ -112,7 +133,8 @@ class BTCPredictionBot:
                 logger.info(f"Cycle {self._cycle_count}: HOLD — {decision.reason}")
                 return
 
-            # 5. Risk
+            # 5. Live bankroll sync + risk
+            await self._sync_live_bankroll_if_enabled()
             can_trade, reason = self.risk_manager.can_trade()
             if not can_trade:
                 logger.info(f"Cycle {self._cycle_count}: BLOCKED — {reason}")
@@ -321,6 +343,8 @@ async def main():
     parser.add_argument("--arb-only", action="store_true", help="Run ONLY the arb scanner — no directional trading")
     parser.add_argument("--hedge", action="store_true", help="Enable hedge engine")
     parser.add_argument("--dashboard", action="store_true", help="Start WebSocket server on :8765 for live dashboard")
+    parser.add_argument("--sync-live-bankroll", action="store_true", help="Sync risk bankroll from live Polymarket account balance")
+    parser.add_argument("--live-bankroll-poll-secs", type=int, default=60, help="Live bankroll sync interval in seconds (default: 60)")
     args = parser.parse_args()
 
     # ── Arb-Only Mode ────────────────────────────────────────────
@@ -329,6 +353,8 @@ async def main():
 
         config = BotConfig(bankroll=args.bankroll)
         config.edge.enable_arb = True
+        config.polymarket.sync_live_bankroll = args.sync_live_bankroll
+        config.polymarket.live_bankroll_poll_secs = args.live_bankroll_poll_secs
 
         arb_config = ArbScannerConfig(
             poll_interval_secs=config.edge.arb_poll_secs,
@@ -422,6 +448,8 @@ async def main():
     # ── Normal Mode (directional + optional arb/hedge) ───────────
     config = BotConfig(bankroll=args.bankroll)
     config.edge.enable_arb = args.arb
+    config.polymarket.sync_live_bankroll = args.sync_live_bankroll
+    config.polymarket.live_bankroll_poll_secs = args.live_bankroll_poll_secs
     config.edge.enable_hedge = args.hedge
     bot = BTCPredictionBot(config, dashboard=args.dashboard)
 

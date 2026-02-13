@@ -11,10 +11,11 @@ import logging
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Any
 from enum import Enum
 
 import aiohttp
+import asyncio
 
 logger = logging.getLogger("polymarket")
 
@@ -127,6 +128,73 @@ class PolymarketClient:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+
+    @staticmethod
+    def _extract_balance_usd(payload: Any) -> Optional[float]:
+        """Best-effort parser for various SDK balance response shapes."""
+        if payload is None:
+            return None
+        if isinstance(payload, (int, float)):
+            return float(payload)
+        if isinstance(payload, str):
+            try:
+                return float(payload)
+            except ValueError:
+                return None
+        if isinstance(payload, dict):
+            preferred_keys = [
+                "available", "balance", "amount", "usdc", "buying_power",
+                "buyingPower", "available_balance", "availableBalance",
+            ]
+            for k in preferred_keys:
+                if k in payload:
+                    v = payload.get(k)
+                    parsed = PolymarketClient._extract_balance_usd(v)
+                    if parsed is not None:
+                        return parsed
+            for v in payload.values():
+                parsed = PolymarketClient._extract_balance_usd(v)
+                if parsed is not None:
+                    return parsed
+        if isinstance(payload, (list, tuple)):
+            for v in payload:
+                parsed = PolymarketClient._extract_balance_usd(v)
+                if parsed is not None:
+                    return parsed
+        return None
+
+    async def get_available_balance_usd(self) -> Optional[float]:
+        """Return available account balance in USD using best-effort SDK calls."""
+        try:
+            if not self._clob_initialized:
+                self._init_clob_client()
+        except Exception as e:
+            logger.warning(f"Balance sync init failed: {e}")
+            return None
+
+        method_names = [
+            "get_balance_allowance",
+            "get_balance",
+            "get_usdc_balance",
+            "get_collateral",
+            "get_available_balance",
+        ]
+
+        for name in method_names:
+            fn = getattr(self._clob, name, None)
+            if not callable(fn):
+                continue
+            try:
+                payload = await asyncio.to_thread(fn)
+                bal = self._extract_balance_usd(payload)
+                if bal is not None:
+                    return float(bal)
+            except Exception as e:
+                logger.debug(f"Balance method {name} failed: {e}")
+                continue
+
+        logger.warning("Could not read live balance from CLOB SDK; keeping configured bankroll")
+        return None
 
     # ── Market Discovery ────────────────────────────────────────
 
