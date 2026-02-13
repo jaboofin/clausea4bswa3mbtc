@@ -36,10 +36,11 @@ class HedgeAction:
     original_trade_id: str
     original_direction: str
     hedge_direction: str
-    original_entry: float    # price paid for original side
-    hedge_price: float       # current price of opposite side
-    locked_profit: float     # guaranteed outcome after hedge
-    size_usd: float
+    original_entry: float     # price paid for original side
+    hedge_price: float        # current price of opposite side
+    original_size_usd: float  # USD spent on original leg
+    hedge_size_usd: float     # USD required for opposite leg to match shares
+    locked_profit: float      # guaranteed outcome after hedge
 
 
 class EdgeEngine:
@@ -159,14 +160,18 @@ class EdgeEngine:
                 hedge_price = market.price_up
                 hedge_dir = "up"
 
-            # Calculate locked outcome
-            # Original: paid entry_price for original side
-            # Hedge: pay hedge_price for opposite side
-            # Total cost: entry_price + hedge_price
-            # Guaranteed payout: $1.00 (one side wins)
-            # Profit: 1.00 - entry_price - hedge_price
-            total_cost = trade.entry_price + hedge_price
-            locked_profit = (1.0 - total_cost) * trade.size_usd
+            # Calculate locked outcome using share-matched hedge sizing.
+            # Original shares bought = original_usd / original_entry
+            # To fully hedge, buy the same share count on opposite side.
+            # hedge_size_usd = original_shares * hedge_price
+            original_shares = trade.size_usd / trade.entry_price if trade.entry_price > 0 else 0.0
+            if original_shares <= 0:
+                continue
+
+            hedge_size_usd = original_shares * hedge_price
+            total_cost = trade.size_usd + hedge_size_usd
+            guaranteed_payout = original_shares * 1.0
+            locked_profit = guaranteed_payout - total_cost
 
             action = HedgeAction(
                 original_trade_id=trade.trade_id,
@@ -174,8 +179,9 @@ class EdgeEngine:
                 hedge_direction=hedge_dir,
                 original_entry=trade.entry_price,
                 hedge_price=hedge_price,
+                original_size_usd=round(trade.size_usd, 2),
+                hedge_size_usd=round(hedge_size_usd, 2),
                 locked_profit=round(locked_profit, 2),
-                size_usd=trade.size_usd,
             )
             actions.append(action)
 
