@@ -42,6 +42,8 @@ class PolymarketConfig:
     order_type: str = "market"
     max_slippage_pct: float = 2.0
     min_liquidity_usd: float = 50.0
+    sync_live_bankroll: bool = False
+    live_bankroll_poll_secs: int = 60
 
 
 @dataclass

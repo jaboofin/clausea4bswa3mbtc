@@ -84,6 +84,7 @@ class RiskManager:
         self._daily.total_pnl += pnl
         self._daily.last_trade_time = time.time()
         self._total_pnl += pnl
+        self.capital += pnl
 
         if pnl >= 0:
             self._daily.wins += 1
@@ -91,7 +92,6 @@ class RiskManager:
         else:
             self._daily.losses += 1
             self._daily.consecutive_losses += 1
-            self.capital += pnl
             if self._daily.consecutive_losses >= self.config.max_consecutive_losses:
                 logger.warning(f"⚠️ {self._daily.consecutive_losses} consecutive losses — cooldown")
 

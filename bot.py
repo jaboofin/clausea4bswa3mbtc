@@ -52,6 +52,8 @@ class BTCPredictionBot:
         self._last_consensus = None
         self._last_anchor = None
         self._last_decision = None
+        self._last_live_bankroll_sync = 0.0
+        self._last_live_bankroll_value = None
 
         # Independent arb scanner (runs its own loop when --arb is enabled)
         if config.edge.enable_arb:
@@ -70,6 +72,25 @@ class BTCPredictionBot:
             self.arb_scanner = None
 
     # ── Trading Cycle ───────────────────────────────────────────
+
+    async def _sync_live_bankroll_if_enabled(self, force: bool = False):
+        if not self.config.polymarket.sync_live_bankroll:
+            return
+
+        now = time.time()
+        poll_secs = max(5, int(self.config.polymarket.live_bankroll_poll_secs))
+        if not force and (now - self._last_live_bankroll_sync) < poll_secs:
+            return
+
+        live_balance = await self.polymarket.get_available_balance_usd()
+        self._last_live_bankroll_sync = now
+
+        if live_balance is None:
+            return
+
+        self._last_live_bankroll_value = round(float(live_balance), 2)
+        self.risk_manager.capital = self._last_live_bankroll_value
+        logger.info(f"Synced live bankroll: ${self._last_live_bankroll_value:.2f}")
 
     async def _trading_cycle(self):
         self._cycle_count += 1
@@ -112,7 +133,8 @@ class BTCPredictionBot:
                 logger.info(f"Cycle {self._cycle_count}: HOLD — {decision.reason}")
                 return
 
-            # 5. Risk
+            # 5. Live bankroll sync + risk
+            await self._sync_live_bankroll_if_enabled()
             can_trade, reason = self.risk_manager.can_trade()
             if not can_trade:
                 logger.info(f"Cycle {self._cycle_count}: BLOCKED — {reason}")
@@ -133,6 +155,7 @@ class BTCPredictionBot:
             # arb check has been removed — the scanner handles it autonomously.
 
             # 6b. Hedge check (if enabled)
+            direction = decision.direction.value
             open_trades = self.polymarket.get_trade_records()
             hedges = self.edge.check_hedge(
                 open_trades=open_trades,
@@ -149,7 +172,7 @@ class BTCPredictionBot:
                 if hedge_market:
                     trade = await self.polymarket.place_order(
                         market=hedge_market, direction=h.hedge_direction,
-                        size_usd=h.size_usd, oracle_price=consensus.price,
+                        size_usd=h.hedge_size_usd, oracle_price=consensus.price,
                         confidence=decision.confidence,
                     )
                     if trade:
@@ -160,7 +183,6 @@ class BTCPredictionBot:
                         })
 
             # 7. Execute directional trade
-            direction = decision.direction.value
             size = self.risk_manager.calculate_position_size(decision.confidence)
             if size <= 0:
                 return
@@ -315,35 +337,62 @@ class BTCPredictionBot:
 async def main():
     import argparse
     parser = argparse.ArgumentParser(description="BTC-15M-Oracle — Polymarket Prediction Bot")
-    parser.add_argument("--bankroll", type=float, default=500.0, help="Starting bankroll in USD (default: 500)")
+    parser.add_argument("--bankroll", type=float, default=500.0, help="Starting bankroll in USD for directional mode (default: 500)")
     parser.add_argument("--cycles", type=int, default=0, help="Max cycles, 0=unlimited (default: 0)")
     parser.add_argument("--arb", action="store_true", help="Enable arbitrage scanner alongside directional trading")
     parser.add_argument("--arb-only", action="store_true", help="Run ONLY the arb scanner — no directional trading")
     parser.add_argument("--hedge", action="store_true", help="Enable hedge engine")
     parser.add_argument("--dashboard", action="store_true", help="Start WebSocket server on :8765 for live dashboard")
+    parser.add_argument("--sync-live-bankroll", action="store_true", help="Sync risk bankroll from live Polymarket account balance")
+    parser.add_argument("--live-bankroll-poll-secs", type=int, default=60, help="Live bankroll sync interval in seconds (default: 60)")
     args = parser.parse_args()
 
     # ── Arb-Only Mode ────────────────────────────────────────────
     if args.arb_only:
         from core.arb_scanner import ArbScanner, ArbScannerConfig
 
-        config = BotConfig(bankroll=args.bankroll)
+        # In arb-only mode, bankroll is sourced from live Polymarket balance.
+        # --bankroll is ignored here and only used in directional mode.
+        config = BotConfig(bankroll=0.0)
         config.edge.enable_arb = True
+        config.polymarket.sync_live_bankroll = True
+        config.polymarket.live_bankroll_poll_secs = args.live_bankroll_poll_secs
+
+        # Polymarket client for order execution + live balance reads
+        polymarket = PolymarketClient(config)
+        live_balance = await polymarket.get_available_balance_usd()
+        if live_balance is None or live_balance <= 0:
+            logger.error("Arb-only mode requires readable positive live Polymarket balance")
+            await polymarket.close()
+            return
+
+        base_size_per_side = config.edge.arb_size_usd
+        base_daily_budget = config.edge.arb_max_daily_budget
+        effective_budget = round(min(base_daily_budget, live_balance), 2)
+        effective_size = round(min(base_size_per_side, effective_budget / 2), 2)
+
+        if effective_size < 0.5 or effective_budget <= 0:
+            logger.error(
+                f"Insufficient live bankroll (${live_balance:.2f}) for arb sizing "
+                f"(size_per_side={base_size_per_side}, budget_cap={base_daily_budget})"
+            )
+            await polymarket.close()
+            return
 
         arb_config = ArbScannerConfig(
             poll_interval_secs=config.edge.arb_poll_secs,
             arb_threshold=config.edge.arb_threshold,
             min_edge_pct=config.edge.arb_min_edge_pct,
-            size_per_side_usd=config.edge.arb_size_usd,
+            size_per_side_usd=effective_size,
             max_daily_arb_trades=config.edge.arb_max_daily_trades,
-            max_daily_arb_budget=config.edge.arb_max_daily_budget,
+            max_daily_arb_budget=effective_budget,
             cooldown_per_market_secs=config.edge.arb_cooldown_secs,
             scan_timeframes=config.edge.arb_timeframes,
         )
 
-        # Polymarket client for order execution
-        polymarket = PolymarketClient(config)
         scanner = ArbScanner(arb_config, polymarket)
+        last_live_balance = live_balance
+        last_live_sync = time.time()
 
         # Optional dashboard
         dashboard = DashboardServer() if args.dashboard else None
@@ -351,8 +400,11 @@ async def main():
         print()
         print("=" * 60)
         print("  BTC ARB SCANNER — ARBITRAGE ONLY MODE")
-        print(f"  Budget: ${config.edge.arb_max_daily_budget}/day")
-        print(f"  Size: ${config.edge.arb_size_usd} per side")
+        print(f"  Live bankroll: ${live_balance:,.2f}")
+        print(f"  Budget cap: ${base_daily_budget:,.2f}/day")
+        print(f"  Effective budget: ${effective_budget:,.2f}/day")
+        print(f"  Size cap: ${base_size_per_side:,.2f} per side")
+        print(f"  Effective size: ${effective_size:,.2f} per side")
         print(f"  Threshold: YES+NO < {config.edge.arb_threshold}")
         print(f"  Polling: every {config.edge.arb_poll_secs}s")
         print(f"  Timeframes: {', '.join(config.edge.arb_timeframes)}")
@@ -382,6 +434,16 @@ async def main():
 
             # Keep alive + periodic dashboard broadcast
             while running and not arb_task.done():
+                if time.time() - last_live_sync >= max(5, args.live_bankroll_poll_secs):
+                    refreshed_balance = await polymarket.get_available_balance_usd()
+                    last_live_sync = time.time()
+                    if refreshed_balance is not None and refreshed_balance > 0:
+                        last_live_balance = refreshed_balance
+                        refreshed_budget = round(min(base_daily_budget, refreshed_balance), 2)
+                        refreshed_size = round(min(base_size_per_side, refreshed_budget / 2), 2)
+                        scanner.config.max_daily_arb_budget = refreshed_budget
+                        scanner.config.size_per_side_usd = max(0.5, refreshed_size)
+
                 if dashboard and dashboard.is_running:
                     try:
                         arb_stats = scanner.get_stats()
@@ -398,7 +460,7 @@ async def main():
                             "risk": {"daily_trades": arb_stats.get("daily_trades", 0), "max_daily_trades": config.edge.arb_max_daily_trades},
                             "positions": {"open": [], "closed": []},
                             "arb_scanner": arb_stats,
-                            "config": {"bankroll": config.bankroll, "arb_enabled": True, "hedge_enabled": False},
+                            "config": {"bankroll": round(last_live_balance, 2), "arb_enabled": True, "hedge_enabled": False},
                         }
                         await dashboard.broadcast(state)
                     except Exception:
@@ -422,6 +484,8 @@ async def main():
     # ── Normal Mode (directional + optional arb/hedge) ───────────
     config = BotConfig(bankroll=args.bankroll)
     config.edge.enable_arb = args.arb
+    config.polymarket.sync_live_bankroll = args.sync_live_bankroll
+    config.polymarket.live_bankroll_poll_secs = args.live_bankroll_poll_secs
     config.edge.enable_hedge = args.hedge
     bot = BTCPredictionBot(config, dashboard=args.dashboard)
 
