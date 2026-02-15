@@ -343,7 +343,7 @@ async def main():
     parser.add_argument("--arb-only", action="store_true", help="Run ONLY the arb scanner — no directional trading")
     parser.add_argument("--hedge", action="store_true", help="Enable hedge engine")
     parser.add_argument("--dashboard", action="store_true", help="Start WebSocket server on :8765 for live dashboard")
-    parser.add_argument("--sync-live-bankroll", action="store_true", help="Sync risk bankroll from live Polymarket account balance")
+    parser.add_argument("--sync-live-bankroll", action="store_true", help="Sync risk bankroll from live Polymarket account balance (directional mode)")
     parser.add_argument("--live-bankroll-poll-secs", type=int, default=60, help="Live bankroll sync interval in seconds (default: 60)")
     args = parser.parse_args()
 
