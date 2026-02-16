@@ -10,6 +10,7 @@ import time
 import logging
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional, Any
 from enum import Enum
@@ -198,37 +199,144 @@ class PolymarketClient:
 
     # ── Market Discovery ────────────────────────────────────────
 
+
+    @staticmethod
+    def _extract_token_ids(market_payload: dict) -> tuple[str, str]:
+        """Extract YES/NO token ids from multiple Gamma payload shapes."""
+        tokens = market_payload.get("tokens", []) or []
+        if isinstance(tokens, list) and len(tokens) >= 2:
+            t0, t1 = tokens[0], tokens[1]
+            up = t0.get("token_id") or t0.get("tokenId") or ""
+            down = t1.get("token_id") or t1.get("tokenId") or ""
+            if up and down:
+                return str(up), str(down)
+
+        raw_ids = market_payload.get("clobTokenIds")
+        parsed_ids = []
+        if isinstance(raw_ids, str):
+            try:
+                parsed_ids = json.loads(raw_ids)
+            except Exception:
+                parsed_ids = []
+        elif isinstance(raw_ids, list):
+            parsed_ids = raw_ids
+
+        if isinstance(parsed_ids, list) and len(parsed_ids) >= 2:
+            up, down = str(parsed_ids[0] or ""), str(parsed_ids[1] or "")
+            if up and down:
+                return up, down
+
+        return "", ""
+
+    @staticmethod
+    def _extract_outcome_prices(market_payload: dict) -> tuple[float, float]:
+        tokens = market_payload.get("tokens", []) or []
+        if isinstance(tokens, list) and len(tokens) >= 2:
+            return float(tokens[0].get("price", 0.5)), float(tokens[1].get("price", 0.5))
+
+        raw_prices = market_payload.get("outcomePrices")
+        parsed_prices = []
+        if isinstance(raw_prices, str):
+            try:
+                parsed_prices = json.loads(raw_prices)
+            except Exception:
+                parsed_prices = []
+        elif isinstance(raw_prices, list):
+            parsed_prices = raw_prices
+
+        if isinstance(parsed_prices, list) and len(parsed_prices) >= 2:
+            try:
+                return float(parsed_prices[0]), float(parsed_prices[1])
+            except Exception:
+                pass
+
+        return 0.5, 0.5
+
     async def discover_markets(self) -> list[BinaryMarket]:
         try:
             session = await self._get_session()
             url = f"{self.config.gamma_api_url}/markets"
-            params = {"active": "true", "closed": "false", "limit": 50, "order": "endDate", "ascending": "true"}
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    logger.error(f"Gamma API {resp.status}")
-                    return []
-                data = await resp.json()
 
             markets = []
-            for m in data:
-                combined = f"{m.get('question', '')} {m.get('slug', '')} {m.get('description', '')}".lower()
-                is_btc = any(k in combined for k in ["btc", "bitcoin"])
-                is_15m = any(k in combined for k in ["15-min", "15 min", "15min", "15-minute"])
-                is_dir = any(k in combined for k in ["up or down", "above", "below", "higher", "lower"])
-                if is_btc and (is_15m or is_dir):
-                    tokens = m.get("tokens", [])
-                    if len(tokens) >= 2:
-                        market = BinaryMarket(
-                            condition_id=m.get("conditionId", m.get("id", "")), question=m.get("question", ""),
-                            slug=m.get("slug", ""), token_id_up=tokens[0].get("token_id", ""),
-                            token_id_down=tokens[1].get("token_id", ""), price_up=float(tokens[0].get("price", 0.5)),
-                            price_down=float(tokens[1].get("price", 0.5)), volume=float(m.get("volume", 0)),
-                            liquidity=float(m.get("liquidityClob", 0)), created_at=m.get("createdAt", ""),
-                            end_date=m.get("endDate", ""), status=MarketStatus.ACTIVE,
-                        )
-                        markets.append(market)
-                        self._active_markets[market.condition_id] = market
-            logger.info(f"Found {len(markets)} BTC 15-min markets")
+            seen_condition_ids: set[str] = set()
+            interval_counts: dict[str, int] = {}
+            offset = 0
+            page_size = 200
+            max_pages = 30
+
+            for page in range(max_pages):
+                params = {
+                    "active": "true",
+                    "closed": "false",
+                    "limit": page_size,
+                    "offset": offset,
+                    "order": "endDate",
+                    "ascending": "true",
+                }
+                async with session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        logger.error(f"Gamma API {resp.status}")
+                        break
+                    data = await resp.json()
+
+                if not data:
+                    break
+
+                for m in data:
+                    slug = (m.get("slug", "") or "").lower()
+                    combined = f"{m.get('question', '')} {slug} {m.get('description', '')}".lower()
+
+                    is_btc = any(k in combined for k in ["btc", "bitcoin"])
+                    slug_match = re.search(r"btc-updown-(\d+[mh])-", slug)
+                    has_supported_interval = bool(slug_match and slug_match.group(1) in {"5m", "15m", "30m", "1h"})
+                    is_directional = any(k in combined for k in ["up or down", "above", "below", "higher", "lower", "updown"])
+
+                    # Canonical btc-updown slug is sufficient by itself.
+                    # Fallback for older naming still requires BTC directional hints.
+                    if not (has_supported_interval or (is_btc and is_directional)):
+                        continue
+
+                    token_id_up, token_id_down = self._extract_token_ids(m)
+                    if not token_id_up or not token_id_down:
+                        continue
+
+                    price_up, price_down = self._extract_outcome_prices(m)
+
+                    condition_id = m.get("conditionId", m.get("id", ""))
+                    if not condition_id or condition_id in seen_condition_ids:
+                        continue
+
+                    market = BinaryMarket(
+                        condition_id=condition_id, question=m.get("question", ""),
+                        slug=slug, token_id_up=token_id_up,
+                        token_id_down=token_id_down, price_up=price_up,
+                        price_down=price_down, volume=float(m.get("volumeNum", m.get("volume", 0))),
+                        liquidity=float(m.get("liquidityClob", m.get("liquidityNum", 0))), created_at=m.get("createdAt", ""),
+                        end_date=m.get("endDate", ""), status=MarketStatus.ACTIVE,
+                    )
+                    markets.append(market)
+                    seen_condition_ids.add(condition_id)
+                    self._active_markets[market.condition_id] = market
+
+                    if slug_match:
+                        interval = slug_match.group(1)
+                        interval_counts[interval] = interval_counts.get(interval, 0) + 1
+
+                if len(data) < page_size:
+                    logger.debug(f"Discovery pagination complete at page {page + 1}")
+                    break
+                offset += page_size
+
+            if interval_counts:
+                logger.info(
+                    f"Found {len(markets)} BTC directional markets by interval: {interval_counts} "
+                    f"(scanned up to {max_pages} pages, page_size={page_size})"
+                )
+            else:
+                logger.info(
+                    f"Found {len(markets)} BTC directional markets "
+                    f"(scanned up to {max_pages} pages, page_size={page_size})"
+                )
             return markets
         except Exception as e:
             logger.error(f"Discovery failed: {e}")
