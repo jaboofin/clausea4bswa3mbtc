@@ -209,9 +209,9 @@ class PolymarketClient:
             interval_counts: dict[str, int] = {}
             offset = 0
             page_size = 200
-            max_pages = 30
+            max_pages = 6
 
-            for page in range(max_pages):
+            for _ in range(max_pages):
                 params = {
                     "active": "true",
                     "closed": "false",
@@ -246,22 +246,16 @@ class PolymarketClient:
                     if len(tokens) < 2:
                         continue
 
-                    t0, t1 = tokens[0], tokens[1]
-                    token_id_up = t0.get("token_id") or t0.get("tokenId") or ""
-                    token_id_down = t1.get("token_id") or t1.get("tokenId") or ""
-                    if not token_id_up or not token_id_down:
-                        continue
-
                     condition_id = m.get("conditionId", m.get("id", ""))
                     if not condition_id or condition_id in seen_condition_ids:
                         continue
 
                     market = BinaryMarket(
                         condition_id=condition_id, question=m.get("question", ""),
-                        slug=slug, token_id_up=token_id_up,
-                        token_id_down=token_id_down, price_up=float(t0.get("price", 0.5)),
-                        price_down=float(t1.get("price", 0.5)), volume=float(m.get("volumeNum", m.get("volume", 0))),
-                        liquidity=float(m.get("liquidityClob", m.get("liquidityNum", 0))), created_at=m.get("createdAt", ""),
+                        slug=slug, token_id_up=tokens[0].get("token_id", ""),
+                        token_id_down=tokens[1].get("token_id", ""), price_up=float(tokens[0].get("price", 0.5)),
+                        price_down=float(tokens[1].get("price", 0.5)), volume=float(m.get("volume", 0)),
+                        liquidity=float(m.get("liquidityClob", 0)), created_at=m.get("createdAt", ""),
                         end_date=m.get("endDate", ""), status=MarketStatus.ACTIVE,
                     )
                     markets.append(market)
@@ -273,20 +267,13 @@ class PolymarketClient:
                         interval_counts[interval] = interval_counts.get(interval, 0) + 1
 
                 if len(data) < page_size:
-                    logger.debug(f"Discovery pagination complete at page {page + 1}")
                     break
                 offset += page_size
 
             if interval_counts:
-                logger.info(
-                    f"Found {len(markets)} BTC directional markets by interval: {interval_counts} "
-                    f"(scanned up to {max_pages} pages, page_size={page_size})"
-                )
+                logger.info(f"Found {len(markets)} BTC directional markets by interval: {interval_counts}")
             else:
-                logger.info(
-                    f"Found {len(markets)} BTC directional markets "
-                    f"(scanned up to {max_pages} pages, page_size={page_size})"
-                )
+                logger.info(f"Found {len(markets)} BTC directional markets")
             return markets
         except Exception as e:
             logger.error(f"Discovery failed: {e}")
