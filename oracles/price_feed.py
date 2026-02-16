@@ -264,23 +264,24 @@ class OracleEngine:
 
     # ── Window Anchor ────────────────────────────────────────────
 
-    def _current_window_boundary(self) -> float:
-        """Start of the CURRENT 15-min window (the one we're inside)."""
+    def _current_window_boundary(self, window_minutes: int = 15) -> float:
+        """Start of the current N-minute window (the one we're inside)."""
+        mins = max(1, int(window_minutes))
         now = time.time()
         dt = datetime.datetime.fromtimestamp(now)
-        window_start_min = (dt.minute // 15) * 15
+        window_start_min = (dt.minute // mins) * mins
         boundary = dt.replace(minute=window_start_min, second=0, microsecond=0)
         return boundary.timestamp()
 
-    async def capture_window_open(self) -> WindowAnchor:
+    async def capture_window_open(self, window_minutes: int = 15) -> WindowAnchor:
         """
-        Capture the opening price of the current 15-min window.
+        Capture the opening price of the current N-minute window.
         This is the price Polymarket uses as the reference —
         end_price >= open_price → UP wins.
 
         Should be called right at or just after the boundary.
         """
-        boundary_ts = self._current_window_boundary()
+        boundary_ts = self._current_window_boundary(window_minutes=window_minutes)
 
         # If we already have an anchor for this window, return it
         if self._window_anchor and self._window_anchor.boundary_time == boundary_ts:
@@ -302,7 +303,7 @@ class OracleEngine:
         boundary_dt = datetime.datetime.fromtimestamp(boundary_ts)
         logger.info(
             f"📌 Window anchor: ${open_price:,.2f} ({source}) "
-            f"for {boundary_dt.strftime('%H:%M')} window"
+            f"for {boundary_dt.strftime('%H:%M')} ({window_minutes}m) window"
         )
         return self._window_anchor
 
