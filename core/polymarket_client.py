@@ -10,6 +10,7 @@ import time
 import logging
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional, Any
 from enum import Enum
@@ -202,33 +203,90 @@ class PolymarketClient:
         try:
             session = await self._get_session()
             url = f"{self.config.gamma_api_url}/markets"
-            params = {"active": "true", "closed": "false", "limit": 50, "order": "endDate", "ascending": "true"}
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    logger.error(f"Gamma API {resp.status}")
-                    return []
-                data = await resp.json()
 
             markets = []
-            for m in data:
-                combined = f"{m.get('question', '')} {m.get('slug', '')} {m.get('description', '')}".lower()
-                is_btc = any(k in combined for k in ["btc", "bitcoin"])
-                is_15m = any(k in combined for k in ["15-min", "15 min", "15min", "15-minute"])
-                is_dir = any(k in combined for k in ["up or down", "above", "below", "higher", "lower"])
-                if is_btc and (is_15m or is_dir):
+            seen_condition_ids: set[str] = set()
+            interval_counts: dict[str, int] = {}
+            offset = 0
+            page_size = 200
+            max_pages = 30
+
+            for page in range(max_pages):
+                params = {
+                    "active": "true",
+                    "closed": "false",
+                    "limit": page_size,
+                    "offset": offset,
+                    "order": "endDate",
+                    "ascending": "true",
+                }
+                async with session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        logger.error(f"Gamma API {resp.status}")
+                        break
+                    data = await resp.json()
+
+                if not data:
+                    break
+
+                for m in data:
+                    slug = (m.get("slug", "") or "").lower()
+                    combined = f"{m.get('question', '')} {slug} {m.get('description', '')}".lower()
+
+                    is_btc = any(k in combined for k in ["btc", "bitcoin"])
+                    slug_match = re.search(r"btc-updown-(\d+[mh])-", slug)
+                    has_supported_interval = bool(slug_match and slug_match.group(1) in {"5m", "15m", "30m", "1h"})
+                    is_directional = any(k in combined for k in ["up or down", "above", "below", "higher", "lower", "updown"])
+
+                    # Keep directional BTC binaries and prioritize canonical up/down slug markets.
+                    if not is_btc or not (has_supported_interval or is_directional):
+                        continue
+
                     tokens = m.get("tokens", [])
-                    if len(tokens) >= 2:
-                        market = BinaryMarket(
-                            condition_id=m.get("conditionId", m.get("id", "")), question=m.get("question", ""),
-                            slug=m.get("slug", ""), token_id_up=tokens[0].get("token_id", ""),
-                            token_id_down=tokens[1].get("token_id", ""), price_up=float(tokens[0].get("price", 0.5)),
-                            price_down=float(tokens[1].get("price", 0.5)), volume=float(m.get("volume", 0)),
-                            liquidity=float(m.get("liquidityClob", 0)), created_at=m.get("createdAt", ""),
-                            end_date=m.get("endDate", ""), status=MarketStatus.ACTIVE,
-                        )
-                        markets.append(market)
-                        self._active_markets[market.condition_id] = market
-            logger.info(f"Found {len(markets)} BTC 15-min markets")
+                    if len(tokens) < 2:
+                        continue
+
+                    t0, t1 = tokens[0], tokens[1]
+                    token_id_up = t0.get("token_id") or t0.get("tokenId") or ""
+                    token_id_down = t1.get("token_id") or t1.get("tokenId") or ""
+                    if not token_id_up or not token_id_down:
+                        continue
+
+                    condition_id = m.get("conditionId", m.get("id", ""))
+                    if not condition_id or condition_id in seen_condition_ids:
+                        continue
+
+                    market = BinaryMarket(
+                        condition_id=condition_id, question=m.get("question", ""),
+                        slug=slug, token_id_up=token_id_up,
+                        token_id_down=token_id_down, price_up=float(t0.get("price", 0.5)),
+                        price_down=float(t1.get("price", 0.5)), volume=float(m.get("volumeNum", m.get("volume", 0))),
+                        liquidity=float(m.get("liquidityClob", m.get("liquidityNum", 0))), created_at=m.get("createdAt", ""),
+                        end_date=m.get("endDate", ""), status=MarketStatus.ACTIVE,
+                    )
+                    markets.append(market)
+                    seen_condition_ids.add(condition_id)
+                    self._active_markets[market.condition_id] = market
+
+                    if slug_match:
+                        interval = slug_match.group(1)
+                        interval_counts[interval] = interval_counts.get(interval, 0) + 1
+
+                if len(data) < page_size:
+                    logger.debug(f"Discovery pagination complete at page {page + 1}")
+                    break
+                offset += page_size
+
+            if interval_counts:
+                logger.info(
+                    f"Found {len(markets)} BTC directional markets by interval: {interval_counts} "
+                    f"(scanned up to {max_pages} pages, page_size={page_size})"
+                )
+            else:
+                logger.info(
+                    f"Found {len(markets)} BTC directional markets "
+                    f"(scanned up to {max_pages} pages, page_size={page_size})"
+                )
             return markets
         except Exception as e:
             logger.error(f"Discovery failed: {e}")
