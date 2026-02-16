@@ -199,6 +199,59 @@ class PolymarketClient:
 
     # ── Market Discovery ────────────────────────────────────────
 
+
+    @staticmethod
+    def _extract_token_ids(market_payload: dict) -> tuple[str, str]:
+        """Extract YES/NO token ids from multiple Gamma payload shapes."""
+        tokens = market_payload.get("tokens", []) or []
+        if isinstance(tokens, list) and len(tokens) >= 2:
+            t0, t1 = tokens[0], tokens[1]
+            up = t0.get("token_id") or t0.get("tokenId") or ""
+            down = t1.get("token_id") or t1.get("tokenId") or ""
+            if up and down:
+                return str(up), str(down)
+
+        raw_ids = market_payload.get("clobTokenIds")
+        parsed_ids = []
+        if isinstance(raw_ids, str):
+            try:
+                parsed_ids = json.loads(raw_ids)
+            except Exception:
+                parsed_ids = []
+        elif isinstance(raw_ids, list):
+            parsed_ids = raw_ids
+
+        if isinstance(parsed_ids, list) and len(parsed_ids) >= 2:
+            up, down = str(parsed_ids[0] or ""), str(parsed_ids[1] or "")
+            if up and down:
+                return up, down
+
+        return "", ""
+
+    @staticmethod
+    def _extract_outcome_prices(market_payload: dict) -> tuple[float, float]:
+        tokens = market_payload.get("tokens", []) or []
+        if isinstance(tokens, list) and len(tokens) >= 2:
+            return float(tokens[0].get("price", 0.5)), float(tokens[1].get("price", 0.5))
+
+        raw_prices = market_payload.get("outcomePrices")
+        parsed_prices = []
+        if isinstance(raw_prices, str):
+            try:
+                parsed_prices = json.loads(raw_prices)
+            except Exception:
+                parsed_prices = []
+        elif isinstance(raw_prices, list):
+            parsed_prices = raw_prices
+
+        if isinstance(parsed_prices, list) and len(parsed_prices) >= 2:
+            try:
+                return float(parsed_prices[0]), float(parsed_prices[1])
+            except Exception:
+                pass
+
+        return 0.5, 0.5
+
     async def discover_markets(self) -> list[BinaryMarket]:
         try:
             session = await self._get_session()
