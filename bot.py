@@ -337,7 +337,7 @@ class BTCPredictionBot:
 async def main():
     import argparse
     parser = argparse.ArgumentParser(description="BTC-15M-Oracle — Polymarket Prediction Bot")
-    parser.add_argument("--bankroll", type=float, default=500.0, help="Starting bankroll in USD for directional mode (default: 500)")
+    parser.add_argument("--bankroll", type=float, default=500.0, help="Starting bankroll in USD for directional mode; also used as arb-only fallback if live balance read fails (default: 500)")
     parser.add_argument("--cycles", type=int, default=0, help="Max cycles, 0=unlimited (default: 0)")
     parser.add_argument("--arb", action="store_true", help="Enable arbitrage scanner alongside directional trading")
     parser.add_argument("--arb-only", action="store_true", help="Run ONLY the arb scanner — no directional trading")
@@ -351,8 +351,8 @@ async def main():
     if args.arb_only:
         from core.arb_scanner import ArbScanner, ArbScannerConfig
 
-        # In arb-only mode, bankroll is sourced from live Polymarket balance.
-        # --bankroll is ignored here and only used in directional mode.
+        # In arb-only mode, limits are sourced from live Polymarket balance.
+        # If live balance cannot be read, --bankroll is used as a fallback.
         config = BotConfig(bankroll=0.0)
         config.edge.enable_arb = True
         # Arb-only mode always sources limits from live account balance.
@@ -363,9 +363,19 @@ async def main():
         polymarket = PolymarketClient(config)
         live_balance = await polymarket.get_available_balance_usd()
         if live_balance is None or live_balance <= 0:
-            logger.error("Arb-only mode requires readable positive live Polymarket balance")
-            await polymarket.close()
-            return
+            if args.bankroll > 0:
+                logger.warning(
+                    "Could not read live balance in arb-only mode; "
+                    f"falling back to --bankroll ${args.bankroll:.2f}"
+                )
+                live_balance = float(args.bankroll)
+            else:
+                logger.error(
+                    "Arb-only mode requires readable positive live Polymarket balance "
+                    "or a positive --bankroll fallback"
+                )
+                await polymarket.close()
+                return
 
         base_size_per_side = config.edge.arb_size_usd
         base_daily_budget = config.edge.arb_max_daily_budget
