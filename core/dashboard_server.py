@@ -125,7 +125,12 @@ def build_dashboard_state(cycle, consensus, anchor, decision, risk_manager, poly
         "risk": {"daily_trades": risk_status.get("daily_trades", 0), "max_daily_trades": config.risk.max_daily_trades, "daily_loss_pct": risk_status.get("daily_loss_pct", 0), "consecutive_losses": risk_status.get("consecutive_losses", 0), "cooldown_active": risk_status.get("cooldown_active", False)},
         "positions": {"open": open_pos, "closed": closed_pos[-50:]},
         "arb_scanner": arb_stats,
-        "config": {"bankroll": config.bankroll, "arb_enabled": edge_config.enable_arb, "hedge_enabled": edge_config.enable_hedge},
+        "config": {
+            "bankroll": risk_status.get("capital", config.bankroll),
+            "starting_bankroll": config.bankroll,
+            "arb_enabled": edge_config.enable_arb,
+            "hedge_enabled": edge_config.enable_hedge,
+        },
     }
 
 

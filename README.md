@@ -60,7 +60,7 @@ The bot is now live, placing real orders with a $100 bankroll. Every 15 minutes 
 
 ### Timing
 
-The bot is **clock-synced** — it doesn't poll randomly. It calculates the exact second to fire before each 15-minute boundary:
+The bot is **clock-synced** — it doesn't poll randomly. Directional mode targets 15-minute boundaries by default, and can automatically switch to 5-minute boundaries when Polymarket only has 5m BTC up/down markets live:
 
 ```
 11:59:00  →  analyze + trade    (targeting 12:00 boundary)
@@ -316,7 +316,7 @@ The bot has multiple layers of protection to prevent catastrophic losses:
 
 **Chainlink-anchored** — The bot uses the same oracle Polymarket resolves against (Chainlink BTC/USD via RTDS websocket). It knows the exact price it needs to beat, not just a generic direction guess.
 
-**Market restriction** — Hardcoded to BTC 15-minute UP/DOWN binary markets only. It will never trade any other asset or market type.
+**Market restriction** — Directional mode is restricted to BTC up/down binaries and auto-selects 15m (preferred) or 5m windows. It will never trade any other asset or market type.
 
 **Oracle consensus** — Chainlink is primary (resolution oracle), Binance and CoinGecko provide redundancy. Rejects stale data (>30s old). Alerts when source spread exceeds 1%.
 
