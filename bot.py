@@ -147,8 +147,14 @@ class BTCPredictionBot:
             markets = await self.polymarket.discover_markets()
             tradeable = [m for m in markets if m.is_tradeable and m.liquidity >= self.config.polymarket.min_liquidity_usd]
 
+            if not markets:
+                logger.info(f"Cycle {self._cycle_count}: No directional markets discovered")
+                return
             if not tradeable:
-                logger.info(f"Cycle {self._cycle_count}: No tradeable markets")
+                logger.info(
+                    f"Cycle {self._cycle_count}: {len(markets)} markets discovered but none met liquidity "
+                    f"threshold ${self.config.polymarket.min_liquidity_usd:.2f}"
+                )
                 return
 
             market = max(tradeable, key=lambda m: m.liquidity)
