@@ -262,9 +262,9 @@ class PolymarketClient:
             interval_counts: dict[str, int] = {}
             offset = 0
             page_size = 200
-            max_pages = 30
+            max_pages = 6
 
-            for page in range(max_pages):
+            for _ in range(max_pages):
                 params = {
                     "active": "true",
                     "closed": "false",
@@ -291,16 +291,13 @@ class PolymarketClient:
                     has_supported_interval = bool(slug_match and slug_match.group(1) in {"5m", "15m", "30m", "1h"})
                     is_directional = any(k in combined for k in ["up or down", "above", "below", "higher", "lower", "updown"])
 
-                    # Canonical btc-updown slug is sufficient by itself.
-                    # Fallback for older naming still requires BTC directional hints.
-                    if not (has_supported_interval or (is_btc and is_directional)):
+                    # Keep directional BTC binaries and prioritize canonical up/down slug markets.
+                    if not is_btc or not (has_supported_interval or is_directional):
                         continue
 
-                    token_id_up, token_id_down = self._extract_token_ids(m)
-                    if not token_id_up or not token_id_down:
+                    tokens = m.get("tokens", [])
+                    if len(tokens) < 2:
                         continue
-
-                    price_up, price_down = self._extract_outcome_prices(m)
 
                     condition_id = m.get("conditionId", m.get("id", ""))
                     if not condition_id or condition_id in seen_condition_ids:
@@ -308,10 +305,10 @@ class PolymarketClient:
 
                     market = BinaryMarket(
                         condition_id=condition_id, question=m.get("question", ""),
-                        slug=slug, token_id_up=token_id_up,
-                        token_id_down=token_id_down, price_up=price_up,
-                        price_down=price_down, volume=float(m.get("volumeNum", m.get("volume", 0))),
-                        liquidity=float(m.get("liquidityClob", m.get("liquidityNum", 0))), created_at=m.get("createdAt", ""),
+                        slug=slug, token_id_up=tokens[0].get("token_id", ""),
+                        token_id_down=tokens[1].get("token_id", ""), price_up=float(tokens[0].get("price", 0.5)),
+                        price_down=float(tokens[1].get("price", 0.5)), volume=float(m.get("volume", 0)),
+                        liquidity=float(m.get("liquidityClob", 0)), created_at=m.get("createdAt", ""),
                         end_date=m.get("endDate", ""), status=MarketStatus.ACTIVE,
                     )
                     markets.append(market)
@@ -323,20 +320,13 @@ class PolymarketClient:
                         interval_counts[interval] = interval_counts.get(interval, 0) + 1
 
                 if len(data) < page_size:
-                    logger.debug(f"Discovery pagination complete at page {page + 1}")
                     break
                 offset += page_size
 
             if interval_counts:
-                logger.info(
-                    f"Found {len(markets)} BTC directional markets by interval: {interval_counts} "
-                    f"(scanned up to {max_pages} pages, page_size={page_size})"
-                )
+                logger.info(f"Found {len(markets)} BTC directional markets by interval: {interval_counts}")
             else:
-                logger.info(
-                    f"Found {len(markets)} BTC directional markets "
-                    f"(scanned up to {max_pages} pages, page_size={page_size})"
-                )
+                logger.info(f"Found {len(markets)} BTC directional markets")
             return markets
         except Exception as e:
             logger.error(f"Discovery failed: {e}")
