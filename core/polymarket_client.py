@@ -10,6 +10,7 @@ import time
 import logging
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional, Any
 from enum import Enum
@@ -210,25 +211,43 @@ class PolymarketClient:
                 data = await resp.json()
 
             markets = []
+            interval_counts: dict[str, int] = {}
             for m in data:
-                combined = f"{m.get('question', '')} {m.get('slug', '')} {m.get('description', '')}".lower()
+                slug = (m.get("slug", "") or "").lower()
+                combined = f"{m.get('question', '')} {slug} {m.get('description', '')}".lower()
+
                 is_btc = any(k in combined for k in ["btc", "bitcoin"])
-                is_15m = any(k in combined for k in ["15-min", "15 min", "15min", "15-minute"])
-                is_dir = any(k in combined for k in ["up or down", "above", "below", "higher", "lower"])
-                if is_btc and (is_15m or is_dir):
-                    tokens = m.get("tokens", [])
-                    if len(tokens) >= 2:
-                        market = BinaryMarket(
-                            condition_id=m.get("conditionId", m.get("id", "")), question=m.get("question", ""),
-                            slug=m.get("slug", ""), token_id_up=tokens[0].get("token_id", ""),
-                            token_id_down=tokens[1].get("token_id", ""), price_up=float(tokens[0].get("price", 0.5)),
-                            price_down=float(tokens[1].get("price", 0.5)), volume=float(m.get("volume", 0)),
-                            liquidity=float(m.get("liquidityClob", 0)), created_at=m.get("createdAt", ""),
-                            end_date=m.get("endDate", ""), status=MarketStatus.ACTIVE,
-                        )
-                        markets.append(market)
-                        self._active_markets[market.condition_id] = market
-            logger.info(f"Found {len(markets)} BTC 15-min markets")
+                slug_match = re.search(r"btc-updown-(\d+[mh])-", slug)
+                has_supported_interval = bool(slug_match and slug_match.group(1) in {"5m", "15m", "30m", "1h"})
+                is_directional = any(k in combined for k in ["up or down", "above", "below", "higher", "lower", "updown"])
+
+                # Keep directional BTC binaries and prioritize canonical up/down slug markets.
+                if not is_btc or not (has_supported_interval or is_directional):
+                    continue
+
+                tokens = m.get("tokens", [])
+                if len(tokens) < 2:
+                    continue
+
+                market = BinaryMarket(
+                    condition_id=m.get("conditionId", m.get("id", "")), question=m.get("question", ""),
+                    slug=slug, token_id_up=tokens[0].get("token_id", ""),
+                    token_id_down=tokens[1].get("token_id", ""), price_up=float(tokens[0].get("price", 0.5)),
+                    price_down=float(tokens[1].get("price", 0.5)), volume=float(m.get("volume", 0)),
+                    liquidity=float(m.get("liquidityClob", 0)), created_at=m.get("createdAt", ""),
+                    end_date=m.get("endDate", ""), status=MarketStatus.ACTIVE,
+                )
+                markets.append(market)
+                self._active_markets[market.condition_id] = market
+
+                if slug_match:
+                    interval = slug_match.group(1)
+                    interval_counts[interval] = interval_counts.get(interval, 0) + 1
+
+            if interval_counts:
+                logger.info(f"Found {len(markets)} BTC directional markets by interval: {interval_counts}")
+            else:
+                logger.info(f"Found {len(markets)} BTC directional markets")
             return markets
         except Exception as e:
             logger.error(f"Discovery failed: {e}")
