@@ -15,6 +15,7 @@ import time
 import logging
 import json
 import datetime
+import re
 from pathlib import Path
 
 from config.settings import BotConfig, MarketDirection
@@ -54,6 +55,8 @@ class BTCPredictionBot:
         self._last_decision = None
         self._last_live_bankroll_sync = 0.0
         self._last_live_bankroll_value = None
+        self._directional_interval_mins = int(config.polymarket.market_interval_minutes or 15)
+        self._last_interval_refresh = 0.0
 
         # Independent arb scanner (runs its own loop when --arb is enabled)
         if config.edge.enable_arb:
@@ -97,7 +100,7 @@ class BTCPredictionBot:
 
         try:
             # 1. Capture window opening price (Chainlink — resolution oracle)
-            anchor = await self.oracle.capture_window_open()
+            anchor = await self.oracle.capture_window_open(window_minutes=self._directional_interval_mins)
             open_price = anchor.open_price if anchor else None
             self._last_anchor = anchor
 
@@ -111,7 +114,7 @@ class BTCPredictionBot:
             })
 
             # 3. Candles
-            candles = await self.oracle.get_candles("15m", limit=100)
+            candles = await self.oracle.get_candles(f"{self._directional_interval_mins}m", limit=100)
             if len(candles) < 30:
                 logger.warning(f"Only {len(candles)} candles — skipping")
                 return
@@ -244,11 +247,11 @@ class BTCPredictionBot:
 
     # ── Clock Sync ──────────────────────────────────────────────
 
-    @staticmethod
-    def _next_boundary() -> float:
+    def _next_boundary(self) -> float:
         now = time.time()
         dt = datetime.datetime.fromtimestamp(now)
-        next_min = ((dt.minute // 15) + 1) * 15
+        interval = max(1, int(self._directional_interval_mins))
+        next_min = ((dt.minute // interval) + 1) * interval
         if next_min >= 60:
             b = dt.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
         else:
@@ -268,6 +271,46 @@ class BTCPredictionBot:
         boundary_dt = datetime.datetime.fromtimestamp(self._next_boundary())
         return f"{entry_dt.strftime('%H:%M:%S')} (→ {boundary_dt.strftime('%H:%M')})"
 
+    def _infer_market_interval_minutes(self, market) -> int | None:
+        slug = (getattr(market, "slug", "") or "").lower()
+        m = re.search(r"btc-updown-(\d+)(m|h)-", slug)
+        if m:
+            qty = int(m.group(1))
+            unit = m.group(2)
+            return qty * (60 if unit == "h" else 1)
+
+        text = f"{getattr(market, 'question', '')} {getattr(market, 'slug', '')}".lower()
+        if any(k in text for k in ["5-min", "5 min", "5m", "5-minute"]):
+            return 5
+        if any(k in text for k in ["15-min", "15 min", "15m", "15-minute"]):
+            return 15
+        return None
+
+    async def _refresh_directional_interval(self, force: bool = False):
+        now = time.time()
+        if not force and (now - self._last_interval_refresh) < 45:
+            return
+        self._last_interval_refresh = now
+
+        markets = await self.polymarket.discover_markets()
+        tradeable = [m for m in markets if m.is_tradeable and m.liquidity >= self.config.polymarket.min_liquidity_usd]
+        if not tradeable:
+            return
+
+        intervals = {self._infer_market_interval_minutes(m) for m in tradeable}
+        intervals.discard(None)
+        if not intervals:
+            return
+
+        target = 15 if 15 in intervals else (5 if 5 in intervals else min(intervals))
+        if target != self._directional_interval_mins:
+            logger.info(
+                f"Directional interval switched: {self._directional_interval_mins}m -> {target}m "
+                f"(available: {sorted(intervals)})"
+            )
+            self._directional_interval_mins = target
+            self._traded_this_window = False
+
     # ── Main Loop ───────────────────────────────────────────────
 
     async def run(self):
@@ -276,7 +319,7 @@ class BTCPredictionBot:
         print("  BTC-15M-Oracle — LIVE")
         print(f"  Bankroll: ${self.config.bankroll:,.2f}")
         print(f"  Arb: {'ON (independent scanner)' if self.config.edge.enable_arb else 'off'}  |  Hedge: {'ON' if self.config.edge.enable_hedge else 'off'}")
-        print(f"  Entry: {self.config.entry_lead_secs}s before :00/:15/:30/:45")
+        print(f"  Entry: {self.config.entry_lead_secs}s before each {self._directional_interval_mins}m boundary (auto 5m/15m)")
         print(f"  Next: {self._format_next_entry()}")
         if self.config.edge.enable_arb:
             print(f"  Arb Scanner: polling every {self.config.edge.arb_poll_secs}s | "
@@ -301,6 +344,8 @@ class BTCPredictionBot:
         self._start_time = time.time()
 
         while self.running:
+            await self._refresh_directional_interval()
+
             if self._is_in_entry_window():
                 if not self._traded_this_window:
                     boundary = datetime.datetime.fromtimestamp(self._next_boundary())
@@ -513,6 +558,8 @@ async def main():
             print(f"\nRunning {args.cycles} cycles | Bankroll: ${args.bankroll}")
             print(f"Next: {bot._format_next_entry()}\n")
             while completed < args.cycles and bot.running:
+                await bot._refresh_directional_interval()
+
                 if bot._is_in_entry_window():
                     if not bot._traded_this_window:
                         await bot._trading_cycle()
