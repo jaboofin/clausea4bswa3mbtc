@@ -203,46 +203,72 @@ class PolymarketClient:
         try:
             session = await self._get_session()
             url = f"{self.config.gamma_api_url}/markets"
-            params = {"active": "true", "closed": "false", "limit": 50, "order": "endDate", "ascending": "true"}
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    logger.error(f"Gamma API {resp.status}")
-                    return []
-                data = await resp.json()
 
             markets = []
+            seen_condition_ids: set[str] = set()
             interval_counts: dict[str, int] = {}
-            for m in data:
-                slug = (m.get("slug", "") or "").lower()
-                combined = f"{m.get('question', '')} {slug} {m.get('description', '')}".lower()
+            offset = 0
+            page_size = 200
+            max_pages = 6
 
-                is_btc = any(k in combined for k in ["btc", "bitcoin"])
-                slug_match = re.search(r"btc-updown-(\d+[mh])-", slug)
-                has_supported_interval = bool(slug_match and slug_match.group(1) in {"5m", "15m", "30m", "1h"})
-                is_directional = any(k in combined for k in ["up or down", "above", "below", "higher", "lower", "updown"])
+            for _ in range(max_pages):
+                params = {
+                    "active": "true",
+                    "closed": "false",
+                    "limit": page_size,
+                    "offset": offset,
+                    "order": "endDate",
+                    "ascending": "true",
+                }
+                async with session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        logger.error(f"Gamma API {resp.status}")
+                        break
+                    data = await resp.json()
 
-                # Keep directional BTC binaries and prioritize canonical up/down slug markets.
-                if not is_btc or not (has_supported_interval or is_directional):
-                    continue
+                if not data:
+                    break
 
-                tokens = m.get("tokens", [])
-                if len(tokens) < 2:
-                    continue
+                for m in data:
+                    slug = (m.get("slug", "") or "").lower()
+                    combined = f"{m.get('question', '')} {slug} {m.get('description', '')}".lower()
 
-                market = BinaryMarket(
-                    condition_id=m.get("conditionId", m.get("id", "")), question=m.get("question", ""),
-                    slug=slug, token_id_up=tokens[0].get("token_id", ""),
-                    token_id_down=tokens[1].get("token_id", ""), price_up=float(tokens[0].get("price", 0.5)),
-                    price_down=float(tokens[1].get("price", 0.5)), volume=float(m.get("volume", 0)),
-                    liquidity=float(m.get("liquidityClob", 0)), created_at=m.get("createdAt", ""),
-                    end_date=m.get("endDate", ""), status=MarketStatus.ACTIVE,
-                )
-                markets.append(market)
-                self._active_markets[market.condition_id] = market
+                    is_btc = any(k in combined for k in ["btc", "bitcoin"])
+                    slug_match = re.search(r"btc-updown-(\d+[mh])-", slug)
+                    has_supported_interval = bool(slug_match and slug_match.group(1) in {"5m", "15m", "30m", "1h"})
+                    is_directional = any(k in combined for k in ["up or down", "above", "below", "higher", "lower", "updown"])
 
-                if slug_match:
-                    interval = slug_match.group(1)
-                    interval_counts[interval] = interval_counts.get(interval, 0) + 1
+                    # Keep directional BTC binaries and prioritize canonical up/down slug markets.
+                    if not is_btc or not (has_supported_interval or is_directional):
+                        continue
+
+                    tokens = m.get("tokens", [])
+                    if len(tokens) < 2:
+                        continue
+
+                    condition_id = m.get("conditionId", m.get("id", ""))
+                    if not condition_id or condition_id in seen_condition_ids:
+                        continue
+
+                    market = BinaryMarket(
+                        condition_id=condition_id, question=m.get("question", ""),
+                        slug=slug, token_id_up=tokens[0].get("token_id", ""),
+                        token_id_down=tokens[1].get("token_id", ""), price_up=float(tokens[0].get("price", 0.5)),
+                        price_down=float(tokens[1].get("price", 0.5)), volume=float(m.get("volume", 0)),
+                        liquidity=float(m.get("liquidityClob", 0)), created_at=m.get("createdAt", ""),
+                        end_date=m.get("endDate", ""), status=MarketStatus.ACTIVE,
+                    )
+                    markets.append(market)
+                    seen_condition_ids.add(condition_id)
+                    self._active_markets[market.condition_id] = market
+
+                    if slug_match:
+                        interval = slug_match.group(1)
+                        interval_counts[interval] = interval_counts.get(interval, 0) + 1
+
+                if len(data) < page_size:
+                    break
+                offset += page_size
 
             if interval_counts:
                 logger.info(f"Found {len(markets)} BTC directional markets by interval: {interval_counts}")
